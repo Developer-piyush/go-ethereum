@@ -336,7 +336,7 @@ With the bootnode operational and externally reachable (you can try
 `telnet <ip> <port>` to ensure it's indeed reachable), start every subsequent `geth`
 node pointed to the bootnode for peer discovery via the `--bootnodes` flag. It will
 probably also be desirable to keep the data directory of your private network separated, so
-do also specify a custom `--datadir` flag.
+do also specify a custom `--datadir` flag..
 
 ```shell
 $ geth --datadir=path/to/custom/data/folder --bootnodes=<bootnode-enode-url-from-above>
