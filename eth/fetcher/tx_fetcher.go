@@ -24,7 +24,7 @@ import (
 	"sort"
 	"time"
 
-	mapset "github.com/deckarep/golang-set"
+	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/core/txpool"
@@ -148,7 +148,7 @@ type TxFetcher struct {
 	drop    chan *txDrop
 	quit    chan struct{}
 
-	underpriced mapset.Set // Transactions discarded as too cheap (don't re-fetch)
+	underpriced mapset.Set[common.Hash] // Transactions discarded as too cheap (don't re-fetch)
 
 	// Stage 1: Waiting lists for newly discovered transactions that might be
 	// broadcast without needing explicit request/reply round trips.
@@ -169,9 +169,9 @@ type TxFetcher struct {
 	alternates map[common.Hash]map[string]struct{} // In-flight transaction alternate origins if retrieval fails
 
 	// Callbacks
-	hasTx    func(common.Hash) bool             // Retrieves a tx from the local txpool
-	addTxs   func([]*types.Transaction) []error // Insert a batch of transactions into local txpool
-	fetchTxs func(string, []common.Hash) error  // Retrieves a set of txs from a remote peer
+	hasTx    func(common.Hash) bool              // Retrieves a tx from the local txpool
+	addTxs   func([]*txpool.Transaction) []error // Insert a batch of transactions into local txpool
+	fetchTxs func(string, []common.Hash) error   // Retrieves a set of txs from a remote peer
 
 	step  chan struct{} // Notification channel when the fetcher loop iterates
 	clock mclock.Clock  // Time wrapper to simulate in tests
@@ -180,14 +180,14 @@ type TxFetcher struct {
 
 // NewTxFetcher creates a transaction fetcher to retrieve transaction
 // based on hash announcements.
-func NewTxFetcher(hasTx func(common.Hash) bool, addTxs func([]*types.Transaction) []error, fetchTxs func(string, []common.Hash) error) *TxFetcher {
+func NewTxFetcher(hasTx func(common.Hash) bool, addTxs func([]*txpool.Transaction) []error, fetchTxs func(string, []common.Hash) error) *TxFetcher {
 	return NewTxFetcherForTests(hasTx, addTxs, fetchTxs, mclock.System{}, nil)
 }
 
 // NewTxFetcherForTests is a testing method to mock out the realtime clock with
 // a simulated version and the internal randomness with a deterministic one.
 func NewTxFetcherForTests(
-	hasTx func(common.Hash) bool, addTxs func([]*types.Transaction) []error, fetchTxs func(string, []common.Hash) error,
+	hasTx func(common.Hash) bool, addTxs func([]*txpool.Transaction) []error, fetchTxs func(string, []common.Hash) error,
 	clock mclock.Clock, rand *mrand.Rand) *TxFetcher {
 	return &TxFetcher{
 		notify:      make(chan *txAnnounce),
@@ -202,7 +202,7 @@ func NewTxFetcherForTests(
 		fetching:    make(map[common.Hash]string),
 		requests:    make(map[string]*txRequest),
 		alternates:  make(map[common.Hash]map[string]struct{}),
-		underpriced: mapset.NewSet(),
+		underpriced: mapset.NewSet[common.Hash](),
 		hasTx:       hasTx,
 		addTxs:      addTxs,
 		fetchTxs:    fetchTxs,
@@ -294,7 +294,12 @@ func (f *TxFetcher) Enqueue(peer string, txs []*types.Transaction, direct bool) 
 			otherreject int64
 		)
 		batch := txs[i:end]
-		for j, err := range f.addTxs(batch) {
+
+		wrapped := make([]*txpool.Transaction, len(batch))
+		for j, tx := range batch {
+			wrapped[j] = &txpool.Transaction{Tx: tx}
+		}
+		for j, err := range f.addTxs(wrapped) {
 			// Track the transaction hash if the price is too low for us.
 			// Avoid re-request this transaction when we receive another
 			// announcement.

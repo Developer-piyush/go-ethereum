@@ -19,7 +19,6 @@ package t8ntool
 import (
 	"fmt"
 	"math/big"
-	"os"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/math"
@@ -47,16 +46,17 @@ type Prestate struct {
 // ExecutionResult contains the execution status after running a state test, any
 // error that might have occurred and a dump of the final state if requested.
 type ExecutionResult struct {
-	StateRoot   common.Hash           `json:"stateRoot"`
-	TxRoot      common.Hash           `json:"txRoot"`
-	ReceiptRoot common.Hash           `json:"receiptsRoot"`
-	LogsHash    common.Hash           `json:"logsHash"`
-	Bloom       types.Bloom           `json:"logsBloom"        gencodec:"required"`
-	Receipts    types.Receipts        `json:"receipts"`
-	Rejected    []*rejectedTx         `json:"rejected,omitempty"`
-	Difficulty  *math.HexOrDecimal256 `json:"currentDifficulty" gencodec:"required"`
-	GasUsed     math.HexOrDecimal64   `json:"gasUsed"`
-	BaseFee     *math.HexOrDecimal256 `json:"currentBaseFee,omitempty"`
+	StateRoot       common.Hash           `json:"stateRoot"`
+	TxRoot          common.Hash           `json:"txRoot"`
+	ReceiptRoot     common.Hash           `json:"receiptsRoot"`
+	LogsHash        common.Hash           `json:"logsHash"`
+	Bloom           types.Bloom           `json:"logsBloom"        gencodec:"required"`
+	Receipts        types.Receipts        `json:"receipts"`
+	Rejected        []*rejectedTx         `json:"rejected,omitempty"`
+	Difficulty      *math.HexOrDecimal256 `json:"currentDifficulty" gencodec:"required"`
+	GasUsed         math.HexOrDecimal64   `json:"gasUsed"`
+	BaseFee         *math.HexOrDecimal256 `json:"currentBaseFee,omitempty"`
+	WithdrawalsRoot *common.Hash          `json:"withdrawalsRoot,omitempty"`
 }
 
 type ommer struct {
@@ -79,6 +79,7 @@ type stEnv struct {
 	ParentTimestamp  uint64                              `json:"parentTimestamp,omitempty"`
 	BlockHashes      map[math.HexOrDecimal64]common.Hash `json:"blockHashes,omitempty"`
 	Ommers           []ommer                             `json:"ommers,omitempty"`
+	Withdrawals      []*types.Withdrawal                 `json:"withdrawals,omitempty"`
 	BaseFee          *big.Int                            `json:"currentBaseFee,omitempty"`
 	ParentUncleHash  common.Hash                         `json:"parentUncleHash"`
 }
@@ -123,7 +124,7 @@ func (pre *Prestate) Apply(vmConfig vm.Config, chainConfig *params.ChainConfig,
 	}
 	var (
 		statedb     = MakePreState(rawdb.NewMemoryDatabase(), pre.Pre)
-		signer      = types.MakeSigner(chainConfig, new(big.Int).SetUint64(pre.Env.Number))
+		signer      = types.MakeSigner(chainConfig, new(big.Int).SetUint64(pre.Env.Number), pre.Env.Timestamp)
 		gaspool     = new(core.GasPool)
 		blockHash   = common.Hash{0x13, 0x37}
 		rejectedTxs []*rejectedTx
@@ -138,7 +139,7 @@ func (pre *Prestate) Apply(vmConfig vm.Config, chainConfig *params.ChainConfig,
 		Transfer:    core.Transfer,
 		Coinbase:    pre.Env.Coinbase,
 		BlockNumber: new(big.Int).SetUint64(pre.Env.Number),
-		Time:        new(big.Int).SetUint64(pre.Env.Timestamp),
+		Time:        pre.Env.Timestamp,
 		Difficulty:  pre.Env.Difficulty,
 		GasLimit:    pre.Env.GasLimit,
 		GetHash:     getHash,
@@ -161,7 +162,7 @@ func (pre *Prestate) Apply(vmConfig vm.Config, chainConfig *params.ChainConfig,
 	}
 
 	for i, tx := range txs {
-		msg, err := tx.AsMessage(signer, pre.Env.BaseFee)
+		msg, err := core.TransactionToMessage(tx, signer, pre.Env.BaseFee)
 		if err != nil {
 			log.Warn("rejected tx", "index", i, "hash", tx.Hash(), "error", err)
 			rejectedTxs = append(rejectedTxs, &rejectedTx{i, err.Error()})
@@ -172,18 +173,22 @@ func (pre *Prestate) Apply(vmConfig vm.Config, chainConfig *params.ChainConfig,
 			return nil, nil, err
 		}
 		vmConfig.Tracer = tracer
-		vmConfig.Debug = (tracer != nil)
-		statedb.Prepare(tx.Hash(), txIndex)
-		txContext := core.NewEVMTxContext(msg)
-		snapshot := statedb.Snapshot()
+		statedb.SetTxContext(tx.Hash(), txIndex)
+
+		var (
+			txContext = core.NewEVMTxContext(msg)
+			snapshot  = statedb.Snapshot()
+			prevGas   = gaspool.Gas()
+		)
 		evm := vm.NewEVM(vmContext, txContext, statedb, chainConfig, vmConfig)
 
 		// (ret []byte, usedGas uint64, failed bool, err error)
 		msgResult, err := core.ApplyMessage(evm, msg, gaspool)
 		if err != nil {
 			statedb.RevertToSnapshot(snapshot)
-			log.Info("rejected tx", "index", i, "hash", tx.Hash(), "from", msg.From(), "error", err)
+			log.Info("rejected tx", "index", i, "hash", tx.Hash(), "from", msg.From, "error", err)
 			rejectedTxs = append(rejectedTxs, &rejectedTx{i, err.Error()})
+			gaspool.SetGas(prevGas)
 			continue
 		}
 		includedTxs = append(includedTxs, tx)
@@ -213,12 +218,12 @@ func (pre *Prestate) Apply(vmConfig vm.Config, chainConfig *params.ChainConfig,
 			receipt.GasUsed = msgResult.UsedGas
 
 			// If the transaction created a contract, store the creation address in the receipt.
-			if msg.To() == nil {
+			if msg.To == nil {
 				receipt.ContractAddress = crypto.CreateAddress(evm.TxContext.Origin, tx.Nonce())
 			}
 
 			// Set the receipt logs and create the bloom filter.
-			receipt.Logs = statedb.GetLogs(tx.Hash(), blockHash)
+			receipt.Logs = statedb.GetLogs(tx.Hash(), vmContext.BlockNumber.Uint64(), blockHash)
 			receipt.Bloom = types.CreateBloom(types.Receipts{receipt})
 			// These three are non-consensus fields:
 			//receipt.BlockHash
@@ -230,11 +235,11 @@ func (pre *Prestate) Apply(vmConfig vm.Config, chainConfig *params.ChainConfig,
 		txIndex++
 	}
 	statedb.IntermediateRoot(chainConfig.IsEIP158(vmContext.BlockNumber))
-	// Add mining reward?
-	if miningReward > 0 {
+	// Add mining reward? (-1 means rewards are disabled)
+	if miningReward >= 0 {
 		// Add mining reward. The mining reward may be `0`, which only makes a difference in the cases
 		// where
-		// - the coinbase suicided, or
+		// - the coinbase self-destructed, or
 		// - there are only 'bad' transactions, which aren't executed. In those cases,
 		//   the coinbase gets no txfee, so isn't created, and thus needs to be touched
 		var (
@@ -254,10 +259,15 @@ func (pre *Prestate) Apply(vmConfig vm.Config, chainConfig *params.ChainConfig,
 		}
 		statedb.AddBalance(pre.Env.Coinbase, minerReward)
 	}
+	// Apply withdrawals
+	for _, w := range pre.Env.Withdrawals {
+		// Amount is in gwei, turn into wei
+		amount := new(big.Int).Mul(new(big.Int).SetUint64(w.Amount), big.NewInt(params.GWei))
+		statedb.AddBalance(w.Address, amount)
+	}
 	// Commit block
-	root, err := statedb.Commit(chainConfig.IsEIP158(vmContext.BlockNumber))
+	root, err := statedb.Commit(vmContext.BlockNumber.Uint64(), chainConfig.IsEIP158(vmContext.BlockNumber))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Could not commit state: %v", err)
 		return nil, nil, NewError(ErrorEVM, fmt.Errorf("could not commit state: %v", err))
 	}
 	execRs := &ExecutionResult{
@@ -272,12 +282,22 @@ func (pre *Prestate) Apply(vmConfig vm.Config, chainConfig *params.ChainConfig,
 		GasUsed:     (math.HexOrDecimal64)(gasUsed),
 		BaseFee:     (*math.HexOrDecimal256)(vmContext.BaseFee),
 	}
+	if pre.Env.Withdrawals != nil {
+		h := types.DeriveSha(types.Withdrawals(pre.Env.Withdrawals), trie.NewStackTrie(nil))
+		execRs.WithdrawalsRoot = &h
+	}
+	// Re-create statedb instance with new root upon the updated database
+	// for accessing latest states.
+	statedb, err = state.New(root, statedb.Database(), nil)
+	if err != nil {
+		return nil, nil, NewError(ErrorEVM, fmt.Errorf("could not reopen state: %v", err))
+	}
 	return statedb, execRs, nil
 }
 
 func MakePreState(db ethdb.Database, accounts core.GenesisAlloc) *state.StateDB {
 	sdb := state.NewDatabaseWithConfig(db, &trie.Config{Preimages: true})
-	statedb, _ := state.New(common.Hash{}, sdb, nil)
+	statedb, _ := state.New(types.EmptyRootHash, sdb, nil)
 	for addr, a := range accounts {
 		statedb.SetCode(addr, a.Code)
 		statedb.SetNonce(addr, a.Nonce)
@@ -287,7 +307,7 @@ func MakePreState(db ethdb.Database, accounts core.GenesisAlloc) *state.StateDB 
 		}
 	}
 	// Commit and re-open to start with a clean state.
-	root, _ := statedb.Commit(false)
+	root, _ := statedb.Commit(0, false)
 	statedb, _ = state.New(root, sdb, nil)
 	return statedb
 }

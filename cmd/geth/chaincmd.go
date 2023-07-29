@@ -39,6 +39,7 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/node"
+	"github.com/ethereum/go-ethereum/trie"
 	"github.com/urfave/cli/v2"
 )
 
@@ -48,7 +49,7 @@ var (
 		Name:      "init",
 		Usage:     "Bootstrap and initialize a new genesis block",
 		ArgsUsage: "<genesisPath>",
-		Flags:     utils.DatabasePathFlags,
+		Flags:     flags.Merge([]cli.Flag{utils.CachePreimagesFlag}, utils.DatabasePathFlags),
 		Description: `
 The init command initializes a new genesis block and definition for the network.
 This is a destructive action and changes the network in which you will be
@@ -188,12 +189,16 @@ func initGenesis(ctx *cli.Context) error {
 	// Open and initialise both full and light databases
 	stack, _ := makeConfigNode(ctx)
 	defer stack.Close()
+
 	for _, name := range []string{"chaindata", "lightchaindata"} {
 		chaindb, err := stack.OpenDatabaseWithFreezer(name, 0, 0, ctx.String(utils.AncientFlag.Name), "", false)
 		if err != nil {
 			utils.Fatalf("Failed to open database: %v", err)
 		}
-		_, hash, err := core.SetupGenesisBlock(chaindb, genesis)
+		triedb := trie.NewDatabaseWithConfig(chaindb, &trie.Config{
+			Preimages: ctx.Bool(utils.CachePreimagesFlag.Name),
+		})
+		_, hash, err := core.SetupGenesisBlock(chaindb, triedb, genesis)
 		if err != nil {
 			utils.Fatalf("Failed to write genesis block: %v", err)
 		}
@@ -256,16 +261,16 @@ func importChain(ctx *cli.Context) error {
 	defer db.Close()
 
 	// Start periodically gathering memory profiles
-	var peakMemAlloc, peakMemSys uint64
+	var peakMemAlloc, peakMemSys atomic.Uint64
 	go func() {
 		stats := new(runtime.MemStats)
 		for {
 			runtime.ReadMemStats(stats)
-			if atomic.LoadUint64(&peakMemAlloc) < stats.Alloc {
-				atomic.StoreUint64(&peakMemAlloc, stats.Alloc)
+			if peakMemAlloc.Load() < stats.Alloc {
+				peakMemAlloc.Store(stats.Alloc)
 			}
-			if atomic.LoadUint64(&peakMemSys) < stats.Sys {
-				atomic.StoreUint64(&peakMemSys, stats.Sys)
+			if peakMemSys.Load() < stats.Sys {
+				peakMemSys.Store(stats.Sys)
 			}
 			time.Sleep(5 * time.Second)
 		}
@@ -298,8 +303,8 @@ func importChain(ctx *cli.Context) error {
 	mem := new(runtime.MemStats)
 	runtime.ReadMemStats(mem)
 
-	fmt.Printf("Object memory: %.3f MB current, %.3f MB peak\n", float64(mem.Alloc)/1024/1024, float64(atomic.LoadUint64(&peakMemAlloc))/1024/1024)
-	fmt.Printf("System memory: %.3f MB current, %.3f MB peak\n", float64(mem.Sys)/1024/1024, float64(atomic.LoadUint64(&peakMemSys))/1024/1024)
+	fmt.Printf("Object memory: %.3f MB current, %.3f MB peak\n", float64(mem.Alloc)/1024/1024, float64(peakMemAlloc.Load())/1024/1024)
+	fmt.Printf("System memory: %.3f MB current, %.3f MB peak\n", float64(mem.Sys)/1024/1024, float64(peakMemSys.Load())/1024/1024)
 	fmt.Printf("Allocations:   %.3f million\n", float64(mem.Mallocs)/1000000)
 	fmt.Printf("GC pause:      %v\n\n", time.Duration(mem.PauseTotalNs))
 
@@ -344,8 +349,8 @@ func exportChain(ctx *cli.Context) error {
 		if first < 0 || last < 0 {
 			utils.Fatalf("Export error: block number must be greater than 0\n")
 		}
-		if head := chain.CurrentFastBlock(); uint64(last) > head.NumberU64() {
-			utils.Fatalf("Export error: block number %d larger than head block %d\n", uint64(last), head.NumberU64())
+		if head := chain.CurrentSnapBlock(); uint64(last) > head.Number.Uint64() {
+			utils.Fatalf("Export error: block number %d larger than head block %d\n", uint64(last), head.Number.Uint64())
 		}
 		err = utils.ExportAppendChain(chain, fp, uint64(first), uint64(last))
 	}
@@ -460,7 +465,10 @@ func dump(ctx *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	state, err := state.New(root, state.NewDatabase(db), nil)
+	config := &trie.Config{
+		Preimages: true, // always enable preimage lookup
+	}
+	state, err := state.New(root, state.NewDatabaseWithConfig(db, config), nil)
 	if err != nil {
 		return err
 	}
@@ -470,7 +478,7 @@ func dump(ctx *cli.Context) error {
 		if conf.OnlyWithAddresses {
 			fmt.Fprintf(os.Stderr, "If you want to include accounts with missing preimages, you need iterative output, since"+
 				" otherwise the accounts will overwrite each other in the resulting mapping.")
-			return fmt.Errorf("incompatible options")
+			return errors.New("incompatible options")
 		}
 		fmt.Println(string(state.Dump(conf)))
 	}
